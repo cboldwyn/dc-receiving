@@ -1,557 +1,460 @@
 """
-DC Receiving v1.0
-Extract data from Metrc transfer manifest PDFs and generate receiving worksheets
+DC Receiving Tool v2.2
+Extract and process transfer manifest data from Metrc PDFs
 
 CHANGELOG:
-v1.0 (2025-11-19)
-- Initial release
-- Extract header and package information from Metrc PDFs
-- Generate receiving worksheet PDFs
-- Support for multiple packages per manifest
+v2.2 (2025-11-19)
+- Changed to only show Quantity Shipped (ignore any received quantities from PDF)
+- Edit mode now for entering received quantities, not showing existing
+- Removed Qty Received column from initial view
+- Variance calculation based on newly entered received quantities
+
+v2.1 (2025-11-19)
+- Fixed item name extraction to correctly capture product names
+- Added line-by-line parsing for better accuracy
+- Improved handling of quantities split across lines
+
+v2.0 (2025-11-18)
+- Initial version with PDF extraction
 """
 
 import streamlit as st
 import pandas as pd
 import io
 import re
-from datetime import datetime
-import pdfplumber
-from reportlab.lib.pagesizes import letter
-from reportlab.lib.units import inch
-from reportlab.lib import colors
-from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, PageBreak
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.lib.enums import TA_CENTER, TA_LEFT
+from typing import List, Dict, Optional
 
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
 
-# Page config
 st.set_page_config(
-    page_title="DC Receiving v1.0",
+    page_title="DC Receiving Tool v2.2",
     page_icon="📦",
     layout="wide"
 )
 
-# Version
-VERSION = "1.0"
-
-# ============================================================================
-# UTILITY FUNCTIONS
-# ============================================================================
-
-def clean_item_name(item_name):
-    """
-    Clean item name by removing everything after the first comma
-    
-    Example:
-        "Bloom Vape - 1.0g Blue Dream (BDR), CAPNA, INC. (Vape Cartridge...)"
-        becomes "Bloom Vape - 1.0g Blue Dream (BDR)"
-    """
-    if pd.isna(item_name):
-        return ""
-    
-    # Split on comma and take first part
-    parts = str(item_name).split(',')
-    return parts[0].strip()
+VERSION = "2.2"
 
 # ============================================================================
 # PDF EXTRACTION FUNCTIONS
 # ============================================================================
 
-def extract_manifest_data(pdf_file):
-    """
-    Extract data from Metrc transfer manifest PDF
-    
-    Returns:
-        tuple: (header_info dict, packages list, raw_text)
-    """
-    header_info = {}
-    packages = []
-    raw_text = ""
-    
+def extract_text_from_pdf(pdf_file) -> str:
+    """Extract text from uploaded PDF file"""
     try:
-        with pdfplumber.open(pdf_file) as pdf:
-            # Extract text from all pages
-            all_text = ""
-            for page in pdf.pages:
-                page_text = page.extract_text()
-                if page_text:
-                    all_text += page_text + "\n"
-            
-            raw_text = all_text
-            
-            # Extract header information
-            header_info = extract_header_info(all_text)
-            
-            # Extract package information
-            packages = extract_packages(all_text)
-            
+        import PyPDF2
+        pdf_reader = PyPDF2.PdfReader(pdf_file)
+        text = ""
+        for page in pdf_reader.pages:
+            text += page.extract_text() + "\n"
+        return text
     except Exception as e:
-        st.error(f"Error extracting PDF data: {str(e)}")
-        return None, None, None
-    
-    return header_info, packages, raw_text
+        st.error(f"Error reading PDF: {str(e)}")
+        return ""
 
-def extract_header_info(text):
-    """Extract header information from manifest text"""
-    header = {}
-    
-    # Manifest number
-    manifest_match = re.search(r'Manifest No\.\s+(\d+)', text)
-    if manifest_match:
-        header['Manifest_Number'] = manifest_match.group(1)
-    
-    # Date created
-    date_match = re.search(r'Date Created\s+(\d{1,2}/\d{1,2}/\d{4}\s+\d{1,2}:\d{2}\s+[AP]M)', text)
-    if date_match:
-        header['Date_Created'] = date_match.group(1)
-    
-    # Originating Entity
-    orig_match = re.search(r'Originating Entity\s+([^\n]+)', text)
-    if orig_match:
-        header['Originating_Entity'] = orig_match.group(1).strip()
-    
-    # Originating License Number
-    orig_lic_match = re.search(r'Originating License Number\s+([^\n]+)', text)
-    if orig_lic_match:
-        header['Originating_License'] = orig_lic_match.group(1).strip()
-    
-    # Destination
-    dest_match = re.search(r'1\. Destination\s+([^\n]+)', text)
-    if dest_match:
-        header['Destination'] = dest_match.group(1).strip()
-    
-    # Destination License
-    dest_lic_match = re.search(r'Destination License Number\s+([^\n]+)', text)
-    if dest_lic_match:
-        header['Destination_License'] = dest_lic_match.group(1).strip()
-    
-    return header
+def extract_manifest_number(text: str) -> Optional[str]:
+    """Extract manifest number from PDF text"""
+    match = re.search(r'Manifest No\.\s+(\d+)', text)
+    return match.group(1) if match else None
 
-def extract_packages(text):
-    """
-    Extract package information from manifest text
-    
-    Returns:
-        list: List of package dictionaries
-    """
+def extract_destination(text: str) -> Optional[str]:
+    """Extract destination from PDF text"""
+    lines = text.split('\n')
+    for i, line in enumerate(lines):
+        if 'Destination' in line and i + 1 < len(lines):
+            dest = lines[i + 1].strip()
+            if dest and dest[0].isupper():
+                return dest
+    return None
+
+def extract_packages(text: str) -> List[Dict]:
+    """Extract package information from manifest text using line-by-line parsing"""
+    lines = text.split('\n')
     packages = []
+    package_count = 0
     
-    # Split text into sections by package number pattern
-    # Pattern looks for: "1. Package | Shipped", "2. Package | Shipped", etc.
-    package_sections = re.split(r'(\d+)\. Package \| Shipped', text)
-    
-    # First element is before any packages, skip it
-    # Then pairs of (number, section_text)
-    for i in range(1, len(package_sections), 2):
-        if i + 1 < len(package_sections):
-            package_num = package_sections[i]
-            section_text = package_sections[i + 1]
-            
-            package_data = extract_package_details(package_num, section_text)
-            if package_data:
-                packages.append(package_data)
+    i = 0
+    while i < len(lines):
+        line = lines[i].strip()
+        
+        # Look for package header
+        if '. Package |' in line:
+            if i + 1 < len(lines) and lines[i + 1].strip() in ['Accepted', 'Shipped']:
+                package_count += 1
+                i += 5  # Skip header lines
+                
+                package_data = extract_single_package(lines, i, package_count)
+                if package_data:
+                    packages.append(package_data)
+        
+        i += 1
     
     return packages
 
-def extract_package_details(package_num, section_text):
-    """Extract details from a single package section"""
-    package = {
-        'Package_Number': package_num
+def extract_single_package(lines: List[str], start_idx: int, package_num: int) -> Optional[Dict]:
+    """Extract a single package starting from given line index"""
+    package_data = {
+        'package_number': package_num,
+        'package_id': None,
+        'item_name': None,
+        'quantity_shipped': None,
+        'production_batch': None,
+        'item_details': {}
     }
     
-    # Package ID (the 1A... number)
-    # Look for pattern like 1A4060300048D3D004765304
-    package_id_match = re.search(r'(1A[A-Z0-9]{20,})', section_text)
-    if package_id_match:
-        package['Package_ID'] = package_id_match.group(1)
+    i = start_idx
     
-    # Item Name (appears after "Item Name" header and before quantity)
-    # Extract text between "Item Name" and "Quantity"
-    item_match = re.search(r'Item Name\s+Quantity\s*\n([^\n]+)', section_text, re.MULTILINE)
-    if item_match:
-        raw_item = item_match.group(1).strip()
+    # Skip any short numeric-only lines
+    while i < len(lines) and lines[i].strip() and lines[i].strip().isdigit() and len(lines[i].strip()) < 3:
+        i += 1
+    
+    # Collect package ID parts
+    package_id_parts = []
+    while i < len(lines):
+        line = lines[i].strip()
+        if 'Lab Test' in line:
+            break
+        if line and (line[0].isalpha() or line.isdigit()) and len(line) <= 15:
+            package_id_parts.append(line)
+        i += 1
+    
+    package_data['package_id'] = ''.join(package_id_parts)
+    
+    # Skip to "Contains Retail IDs: No"
+    while i < len(lines) and 'Contains Retail IDs' not in lines[i]:
+        i += 1
+    i += 1
+    
+    # Collect item name until "Shp:" or "Item Details"
+    item_name_parts = []
+    while i < len(lines):
+        line = lines[i].strip()
+        if 'Shp:' in line or 'Item Details' in line:
+            break
+        if line:
+            item_name_parts.append(line)
+        i += 1
+    
+    package_data['item_name'] = ' '.join(item_name_parts)
+    
+    # Extract shipped quantity only (ignore any received quantity)
+    if i < len(lines) and 'Shp:' in lines[i]:
+        qty_lines = [lines[i]]
+        for j in range(i+1, min(i+3, len(lines))):
+            qty_lines.append(lines[j])
+            if 'ea' in lines[j]:
+                i = j + 1
+                break
         
-        # Remove Package ID prefix if present
-        if package.get('Package_ID'):
-            raw_item = raw_item.replace(package['Package_ID'], '').strip()
+        qty_text = ' '.join(qty_lines)
+        shp_match = re.search(r'Shp:\s*(\d+(?:\.\d+)?)', qty_text)
+        if shp_match:
+            package_data['quantity_shipped'] = float(shp_match.group(1))
+    
+    # Extract item details - Weight, Volume, Strain
+    for j in range(i, min(len(lines), i + 20)):
+        line = lines[j].strip()
         
-        # Remove "Shp: XX ea" suffix if present
-        raw_item = re.sub(r'\s*Shp:\s*\d+\s*ea\s*$', '', raw_item)
+        if line.startswith('Wgt:') or line.startswith('Weight:'):
+            wgt_match = re.search(r'(\d+(?:\.\d+)?)\s*(g|kg|oz|lb)', line, re.IGNORECASE)
+            if wgt_match:
+                package_data['item_details']['weight'] = f"{wgt_match.group(1)} {wgt_match.group(2)}"
         
-        # Clean the item name
-        package['Item_Name_Raw'] = raw_item
-        package['Item_Name'] = clean_item_name(raw_item)
-    else:
-        # Alternative pattern - sometimes the layout is different
-        item_match2 = re.search(r'Item Name\s*\n([^\n]+)\n', section_text, re.MULTILINE)
-        if item_match2:
-            raw_item = item_match2.group(1).strip()
-            
-            # Remove Package ID prefix if present
-            if package.get('Package_ID'):
-                raw_item = raw_item.replace(package['Package_ID'], '').strip()
-            
-            # Remove "Shp: XX ea" suffix if present
-            raw_item = re.sub(r'\s*Shp:\s*\d+\s*ea\s*$', '', raw_item)
-            
-            package['Item_Name_Raw'] = raw_item
-            package['Item_Name'] = clean_item_name(raw_item)
+        if line.startswith('Vol:') or line.startswith('Volume:'):
+            vol_match = re.search(r'(\d+(?:\.\d+)?)\s*(ml|l|fl\s*oz)', line, re.IGNORECASE)
+            if vol_match:
+                package_data['item_details']['volume'] = f"{vol_match.group(1)} {vol_match.group(2)}"
+        
+        if line.startswith('Strain:'):
+            strain_match = re.search(r'Strain:\s*([^\|]+)', line)
+            if strain_match:
+                package_data['item_details']['strain'] = strain_match.group(1).strip()
     
-    # Quantity (look for "Shp: XX ea" pattern)
-    qty_match = re.search(r'Shp:\s*(\d+)\s*ea', section_text)
-    if qty_match:
-        package['Quantity'] = qty_match.group(1)
+    # Look for production batch
+    for j in range(i, min(len(lines), i + 50)):
+        if 'Source Production Batch' in lines[j]:
+            if j + 1 < len(lines):
+                batch_line = lines[j + 1].strip()
+                if batch_line:
+                    package_data['production_batch'] = batch_line
+                else:
+                    batch_match = re.search(r'Source Production Batch\s+([\w\-,]+)', lines[j])
+                    if batch_match:
+                        package_data['production_batch'] = batch_match.group(1)
+            break
     
-    # Item Details (look for "Wgt: X g" or similar)
-    details_match = re.search(r'Item Details\s+([^\n]+)', section_text)
-    if details_match:
-        package['Item_Details'] = details_match.group(1).strip()
-    
-    # Source Production Batch
-    batch_match = re.search(r'Source Production Batch\s+([^\n]+)', section_text)
-    if batch_match:
-        package['Batch'] = batch_match.group(1).strip()
-    
-    return package
+    return package_data
 
 # ============================================================================
-# PDF GENERATION FUNCTIONS
+# DATA PROCESSING FUNCTIONS
 # ============================================================================
 
-def generate_receiving_worksheet(header_info, packages):
-    """
-    Generate a receiving worksheet PDF
+def packages_to_dataframe(packages: List[Dict]) -> pd.DataFrame:
+    """Convert package list to DataFrame - only show shipped quantities"""
+    if not packages:
+        return pd.DataFrame()
     
-    Returns:
-        BytesIO buffer containing the PDF
-    """
-    buffer = io.BytesIO()
+    rows = []
+    for pkg in packages:
+        row = {
+            'Package #': pkg['package_number'],
+            'Package ID': pkg['package_id'],
+            'Item Name': pkg['item_name'],
+            'Qty Shipped': pkg['quantity_shipped'],
+            'Production Batch': pkg['production_batch'],
+            'Weight': pkg['item_details'].get('weight', ''),
+            'Volume': pkg['item_details'].get('volume', ''),
+            'Strain': pkg['item_details'].get('strain', '')
+        }
+        rows.append(row)
     
-    # Create document
-    doc = SimpleDocTemplate(
-        buffer,
-        pagesize=letter,
-        rightMargin=0.5*inch,
-        leftMargin=0.5*inch,
-        topMargin=0.75*inch,
-        bottomMargin=0.75*inch
-    )
-    
-    # Styles
-    styles = getSampleStyleSheet()
-    title_style = ParagraphStyle(
-        'CustomTitle',
-        parent=styles['Heading1'],
-        fontSize=16,
-        textColor=colors.HexColor('#008B8B'),
-        spaceAfter=12,
-        alignment=TA_CENTER
-    )
-    
-    header_style = ParagraphStyle(
-        'CustomHeader',
-        parent=styles['Normal'],
-        fontSize=10,
-        spaceAfter=6
-    )
-    
-    # Story (content)
-    story = []
-    
-    # Title
-    title = Paragraph("RECEIVING WORKSHEET", title_style)
-    story.append(title)
-    story.append(Spacer(1, 0.2*inch))
-    
-    # Header Information
-    if header_info:
-        header_data = [
-            ['Manifest #:', header_info.get('Manifest_Number', 'N/A')],
-            ['Date:', header_info.get('Date_Created', 'N/A')],
-            ['From:', header_info.get('Originating_Entity', 'N/A')],
-            ['License:', header_info.get('Originating_License', 'N/A')],
-            ['Destination:', header_info.get('Destination', 'N/A')],
-        ]
-        
-        header_table = Table(header_data, colWidths=[1.5*inch, 5*inch])
-        header_table.setStyle(TableStyle([
-            ('FONT', (0, 0), (0, -1), 'Helvetica-Bold'),
-            ('FONT', (1, 0), (1, -1), 'Helvetica'),
-            ('FONTSIZE', (0, 0), (-1, -1), 9),
-            ('ALIGN', (0, 0), (0, -1), 'RIGHT'),
-            ('ALIGN', (1, 0), (1, -1), 'LEFT'),
-            ('VALIGN', (0, 0), (-1, -1), 'TOP'),
-            ('BOTTOMPADDING', (0, 0), (-1, -1), 3),
-        ]))
-        
-        story.append(header_table)
-        story.append(Spacer(1, 0.3*inch))
-    
-    # Package Table
-    if packages:
-        # Table header
-        table_data = [[
-            '#',
-            'Item Name',
-            'Quantity\n(Verify)',
-            'Batch\n(Verify)',
-            'Package ID'
-        ]]
-        
-        # Add each package
-        for pkg in packages:
-            row = [
-                pkg.get('Package_Number', ''),
-                pkg.get('Item_Name', ''),
-                pkg.get('Quantity', '') + ' ea',
-                pkg.get('Batch', ''),
-                pkg.get('Package_ID', '')[-8:]  # Last 8 chars for space
-            ]
-            table_data.append(row)
-        
-        # Create table
-        package_table = Table(
-            table_data,
-            colWidths=[0.4*inch, 2.8*inch, 0.9*inch, 1.5*inch, 1*inch],
-            repeatRows=1  # Repeat header on each page
-        )
-        
-        # Table style
-        package_table.setStyle(TableStyle([
-            # Header row
-            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#008B8B')),
-            ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
-            ('FONT', (0, 0), (-1, 0), 'Helvetica-Bold'),
-            ('FONTSIZE', (0, 0), (-1, 0), 9),
-            ('ALIGN', (0, 0), (-1, 0), 'CENTER'),
-            ('VALIGN', (0, 0), (-1, 0), 'MIDDLE'),
-            
-            # Data rows
-            ('FONT', (0, 1), (-1, -1), 'Helvetica'),
-            ('FONTSIZE', (0, 1), (-1, -1), 8),
-            ('ALIGN', (0, 1), (0, -1), 'CENTER'),  # Package number centered
-            ('ALIGN', (1, 1), (1, -1), 'LEFT'),     # Item name left
-            ('ALIGN', (2, 1), (-1, -1), 'CENTER'),  # Rest centered
-            ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
-            
-            # Borders
-            ('GRID', (0, 0), (-1, -1), 0.5, colors.grey),
-            ('LINEBELOW', (0, 0), (-1, 0), 1, colors.HexColor('#008B8B')),
-            
-            # Padding
-            ('TOPPADDING', (0, 0), (-1, -1), 8),
-            ('BOTTOMPADDING', (0, 0), (-1, -1), 8),
-            ('LEFTPADDING', (0, 0), (-1, -1), 6),
-            ('RIGHTPADDING', (0, 0), (-1, -1), 6),
-            
-            # Alternating row colors
-            ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#F0F0F0')]),
-        ]))
-        
-        story.append(package_table)
-        story.append(Spacer(1, 0.3*inch))
-    
-    # Footer notes
-    notes = Paragraph(
-        "<b>Notes:</b> Verify quantities and batch numbers match the physical products. "
-        "Make any corrections directly on this worksheet.",
-        styles['Normal']
-    )
-    story.append(notes)
-    story.append(Spacer(1, 0.2*inch))
-    
-    # Signature line
-    sig_data = [
-        ['Received By:', '_' * 40, 'Date:', '_' * 20],
-    ]
-    sig_table = Table(sig_data, colWidths=[1*inch, 3*inch, 0.7*inch, 2*inch])
-    sig_table.setStyle(TableStyle([
-        ('FONT', (0, 0), (-1, -1), 'Helvetica'),
-        ('FONTSIZE', (0, 0), (-1, -1), 9),
-        ('ALIGN', (0, 0), (0, -1), 'RIGHT'),
-        ('ALIGN', (2, 0), (2, -1), 'RIGHT'),
-        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
-    ]))
-    story.append(sig_table)
-    
-    # Build PDF
-    doc.build(story)
-    
-    buffer.seek(0)
-    return buffer
+    return pd.DataFrame(rows)
 
 # ============================================================================
 # MAIN APPLICATION
 # ============================================================================
 
 def main():
-    st.title(f"📦 DC Receiving v{VERSION}")
-    st.markdown("Extract data from Metrc transfer manifest PDFs and generate receiving worksheets")
+    st.title(f"📦 DC Receiving Tool v{VERSION}")
+    st.markdown("Process transfer manifests and track received inventory")
     
     # Sidebar
     st.sidebar.header("📄 Upload Manifest")
     uploaded_file = st.sidebar.file_uploader(
-        "Upload Metrc PDF:",
+        "Upload Transfer Manifest PDF:",
         type=['pdf'],
-        help="Upload a Metrc Cannabis Transportation Manifest PDF"
+        help="Upload a Metrc transfer manifest PDF"
     )
     
-    st.sidebar.markdown("---")
-    
-    # Main content
-    if uploaded_file is None:
-        st.info("👆 Upload a Metrc transfer manifest PDF to get started")
+    if uploaded_file:
+        # Extract text from PDF
+        with st.spinner("Reading PDF..."):
+            pdf_text = extract_text_from_pdf(uploaded_file)
         
-        # Instructions
-        st.markdown("### How to Use")
-        st.markdown("""
-        1. **Upload** a Metrc transfer manifest PDF using the sidebar
-        2. **Review** the extracted information in the Data tab
-        3. **Generate** a receiving worksheet PDF for verification
-        4. **Download** the worksheet and use it during receiving
-        
-        The worksheet will list all items in the same order as the original manifest,
-        making it easy to verify quantities and batch numbers and note any corrections.
-        """)
-        
-    else:
-        # Extract data from PDF
-        with st.spinner("📄 Extracting data from PDF..."):
-            header_info, packages, raw_text = extract_manifest_data(uploaded_file)
-        
-        if header_info is None or packages is None:
-            st.error("❌ Failed to extract data from PDF")
+        if not pdf_text:
+            st.error("Could not extract text from PDF")
             return
         
-        st.success(f"✅ Extracted {len(packages)} package(s) from manifest")
+        # Extract manifest info
+        manifest_num = extract_manifest_number(pdf_text)
+        destination = extract_destination(pdf_text)
         
-        # Display extracted data in tabs
-        tab1, tab2, tab3 = st.tabs(["📊 Overview", "📦 Packages", "🔧 Debug"])
+        # Display manifest info
+        st.subheader("📋 Manifest Information")
+        col1, col2 = st.columns(2)
+        with col1:
+            st.metric("Manifest Number", manifest_num or "Not Found")
+        with col2:
+            st.metric("Destination", destination or "Not Found")
         
-        with tab1:
-            st.subheader("📋 Manifest Information")
+        # Extract packages
+        with st.spinner("Extracting package data..."):
+            packages = extract_packages(pdf_text)
+        
+        if not packages:
+            st.warning("No packages found in manifest")
             
-            if header_info:
-                col1, col2 = st.columns(2)
+            with st.expander("🔍 Debug: View Raw Text"):
+                st.text_area("PDF Text (first 2000 chars)", pdf_text[:2000], height=400)
+            return
+        
+        st.success(f"✅ Found {len(packages)} packages")
+        
+        # Convert to DataFrame
+        df = packages_to_dataframe(packages)
+        
+        # Tabs for different views
+        tabs = st.tabs(["📊 Package List", "✏️ Enter Received Quantities", "📈 Summary", "🔍 Debug"])
+        
+        with tabs[0]:  # Package List
+            st.subheader("Package List - Shipped Quantities")
+            st.dataframe(df, use_container_width=True, height=600)
+            
+            # Download button
+            csv = df.to_csv(index=False)
+            st.download_button(
+                "📥 Download CSV",
+                csv,
+                f"manifest_{manifest_num}_packages.csv",
+                "text/csv",
+                key="download_main"
+            )
+        
+        with tabs[1]:  # Enter Received Quantities
+            st.subheader("Enter Received Quantities")
+            st.markdown("Enter the quantities you received for each package:")
+            
+            # Create form for receiving
+            received_data = df.copy()
+            received_data['Qty Received'] = 0.0
+            
+            for idx, row in received_data.iterrows():
+                col1, col2, col3, col4 = st.columns([1, 3, 1, 1])
                 
                 with col1:
-                    st.markdown("**Manifest Details:**")
-                    st.write(f"• Manifest #: {header_info.get('Manifest_Number', 'N/A')}")
-                    st.write(f"• Date: {header_info.get('Date_Created', 'N/A')}")
+                    st.text(f"#{row['Package #']}")
                 
                 with col2:
-                    st.markdown("**From/To:**")
-                    st.write(f"• From: {header_info.get('Originating_Entity', 'N/A')}")
-                    st.write(f"• To: {header_info.get('Destination', 'N/A')}")
-            
-            st.markdown("---")
-            
-            # Summary metrics
-            st.subheader("📊 Summary")
-            col1, col2, col3 = st.columns(3)
-            
-            with col1:
-                st.metric("Total Packages", len(packages))
-            
-            with col2:
-                total_qty = sum(int(pkg.get('Quantity', 0)) for pkg in packages if pkg.get('Quantity', '').isdigit())
-                st.metric("Total Units", f"{total_qty:,}")
-            
-            with col3:
-                unique_items = len(set(pkg.get('Item_Name', '') for pkg in packages))
-                st.metric("Unique Items", unique_items)
-            
-            st.markdown("---")
-            
-            # Generate worksheet button
-            st.subheader("📄 Generate Receiving Worksheet")
-            
-            if st.button("🚀 Generate Worksheet PDF", type="primary"):
-                with st.spinner("📄 Generating worksheet..."):
-                    pdf_buffer = generate_receiving_worksheet(header_info, packages)
+                    # Show full item name in expander if too long
+                    if len(row['Item Name']) > 50:
+                        st.text(row['Item Name'][:50] + "...")
+                        with st.expander("Show full name"):
+                            st.text(row['Item Name'])
+                    else:
+                        st.text(row['Item Name'])
                 
-                if pdf_buffer:
-                    st.success("✅ Worksheet generated successfully!")
-                    
-                    # Download button
-                    manifest_num = header_info.get('Manifest_Number', 'unknown')
-                    filename = f"receiving_worksheet_{manifest_num}.pdf"
-                    
-                    st.download_button(
-                        label="📥 Download Worksheet",
-                        data=pdf_buffer,
-                        file_name=filename,
-                        mime="application/pdf"
+                with col3:
+                    st.text(f"Shipped: {row['Qty Shipped']}")
+                
+                with col4:
+                    received = st.number_input(
+                        "Received",
+                        value=float(row['Qty Shipped'] or 0),  # Default to shipped qty
+                        min_value=0.0,
+                        step=1.0,
+                        key=f"rcv_{idx}",
+                        label_visibility="collapsed"
                     )
-        
-        with tab2:
-            st.subheader("📦 Package Details")
+                    received_data.at[idx, 'Qty Received'] = received
             
-            if packages:
-                # Convert to DataFrame for display
-                display_df = pd.DataFrame(packages)
-                
-                # Select columns to display
-                display_cols = ['Package_Number', 'Item_Name', 'Quantity', 'Batch', 'Package_ID', 'Item_Details']
-                display_cols = [col for col in display_cols if col in display_df.columns]
-                
-                st.dataframe(
-                    display_df[display_cols],
-                    use_container_width=True,
-                    hide_index=True
-                )
-                
-                # Download raw data
-                st.markdown("---")
-                csv_buffer = io.StringIO()
-                display_df.to_csv(csv_buffer, index=False)
-                
-                st.download_button(
-                    label="📥 Download Package Data (CSV)",
-                    data=csv_buffer.getvalue(),
-                    file_name=f"manifest_{header_info.get('Manifest_Number', 'unknown')}_data.csv",
-                    mime="text/csv"
-                )
-            else:
-                st.warning("No packages found in manifest")
-        
-        with tab3:
-            st.subheader("🔧 Debug Information")
-            
-            st.markdown("**Extraction Summary:**")
-            st.write(f"• Packages found: {len(packages)}")
-            st.write(f"• Header fields: {len(header_info)}")
+            # Calculate variance
+            received_data['Variance'] = received_data['Qty Received'] - received_data['Qty Shipped']
+            received_data['Variance %'] = received_data.apply(
+                lambda row: (row['Variance'] / row['Qty Shipped'] * 100) 
+                if pd.notna(row['Qty Shipped']) and row['Qty Shipped'] > 0 
+                else None,
+                axis=1
+            )
             
             st.markdown("---")
+            st.subheader("Receiving Summary")
             
-            with st.expander("📋 Header Info (Dict)"):
-                st.json(header_info)
+            # Show variance summary
+            total_shipped = received_data['Qty Shipped'].sum()
+            total_received = received_data['Qty Received'].sum()
+            total_variance = total_received - total_shipped
             
-            with st.expander("📦 Packages (List)"):
-                st.json(packages)
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("Total Shipped", f"{total_shipped:,.0f} ea")
+            with col2:
+                st.metric("Total Received", f"{total_received:,.0f} ea")
+            with col3:
+                st.metric("Total Variance", f"{total_variance:,.0f} ea")
             
-            with st.expander("📄 Raw PDF Text"):
-                st.text_area("Raw Text", raw_text, height=400)
+            # Show updated data
+            st.dataframe(
+                received_data[['Package #', 'Package ID', 'Item Name', 'Qty Shipped', 'Qty Received', 'Variance', 'Variance %']],
+                use_container_width=True
+            )
+            
+            # Download button
+            received_csv = received_data.to_csv(index=False)
+            st.download_button(
+                "📥 Download Receiving Report",
+                received_csv,
+                f"manifest_{manifest_num}_receiving_report.csv",
+                "text/csv",
+                key="download_received"
+            )
+        
+        with tabs[2]:  # Summary
+            st.subheader("📈 Manifest Summary")
+            
+            total_packages = len(df)
+            total_shipped = df['Qty Shipped'].sum() if 'Qty Shipped' in df.columns else 0
+            
+            col1, col2 = st.columns(2)
+            with col1:
+                st.metric("Total Packages", f"{total_packages:,}")
+            with col2:
+                st.metric("Total Quantity Shipped", f"{total_shipped:,.0f} ea")
+            
+            # Show breakdown by category if we can infer it
+            st.markdown("### Package Details")
+            st.dataframe(
+                df[['Package #', 'Item Name', 'Qty Shipped', 'Production Batch']],
+                use_container_width=True
+            )
+        
+        with tabs[3]:  # Debug
+            st.subheader("🔍 Debug Information")
+            
+            # Show first 3 packages raw data
+            st.markdown("**First 3 Packages Raw Data:**")
+            for i, pkg in enumerate(packages[:3]):
+                with st.expander(f"Package {i+1}: {pkg['item_name'][:50]}..."):
+                    st.json(pkg)
+            
+            # Show DataFrame info
+            st.markdown("**DataFrame Info:**")
+            st.write(f"Shape: {df.shape}")
+            st.write(f"Columns: {list(df.columns)}")
+            
+            # Show extraction stats
+            st.markdown("**Extraction Statistics:**")
+            stats = {
+                'Total Packages': len(packages),
+                'With Package ID': sum(1 for p in packages if p['package_id']),
+                'With Item Name': sum(1 for p in packages if p['item_name']),
+                'With Qty Shipped': sum(1 for p in packages if p['quantity_shipped'] is not None),
+                'With Prod Batch': sum(1 for p in packages if p['production_batch'])
+            }
+            st.json(stats)
     
-    # Changelog in sidebar
-    with st.sidebar.expander("📋 Version History & Changelog"):
+    else:
+        # Instructions
+        st.info("👆 Upload a transfer manifest PDF to get started")
+        
         st.markdown("""
-        **v1.0** (Current)
-        - Initial release
-        - Extract header information from Metrc PDFs
-        - Extract package details (item, quantity, batch, package ID)
-        - Clean item names by removing supplier info
-        - Generate receiving worksheet PDFs
-        - Maintain package order from original manifest
-        - Include verification columns for quantity and batch
-        - Support for multiple packages per manifest
+        ### How to Use
+        
+        1. **Upload Manifest**: Upload a Metrc transfer manifest PDF (before or after receiving)
+        2. **Review Packages**: Check the extracted package list with shipped quantities
+        3. **Enter Received Quantities**: Use the second tab to enter what you actually received
+        4. **View Summary**: Check totals and variances
+        5. **Download Report**: Export the receiving report as CSV
+        
+        ### ✨ What's New in v2.2
+        
+        - ✅ **Only shows shipped quantities** - Ignores any received quantities from PDF
+        - ✅ **Clean receiving workflow** - Enter received quantities fresh
+        - ✅ **Works with both manifest types** - Before or after receiving
+        - ✅ **Variance tracking** - Automatically calculates differences
+        
+        ### Features
+        
+        - ✅ Automatic extraction from Metrc PDF manifests
+        - ✅ Correct item name extraction
+        - ✅ Handles multi-line text formatting
+        - ✅ Works with "Accepted" and "Shipped" packages
+        - ✅ Extracts weight, volume, and strain information
+        - ✅ Edit mode for receiving
+        - ✅ Variance calculations
+        - ✅ Export to CSV
         """)
     
+    # Version info in sidebar
     st.sidebar.markdown("---")
     st.sidebar.markdown(f"**Version {VERSION}**")
+    
+    with st.sidebar.expander("📋 Changelog"):
+        st.markdown("""
+        **v2.2** (2025-11-19)
+        - Only shows Quantity Shipped
+        - Removed Qty Received from PDF
+        - Clean receiving workflow
+        - Works with both manifest types
+        
+        **v2.1** (2025-11-19)
+        - Fixed item name extraction
+        - Line-by-line PDF parsing
+        - Better quantity handling
+        
+        **v2.0** (2025-11-18)
+        - Initial PDF extraction version
+        """)
 
 if __name__ == "__main__":
     main()
