@@ -1,8 +1,15 @@
 """
-DC Receiving Tool v3.3
+DC Receiving Tool v3.4
 Extract and process transfer manifest data from Metrc PDFs and generate receiving worksheets
 
 CHANGELOG:
+v3.4 (2025-12-01)
+- Added optional Distru Packages CSV integration
+- Match METRC Package IDs to Distru Package Labels automatically
+- Export Distru Import CSV with exact column format for Distru system
+- Store Distru ID, Batch Number, and other metadata with each package
+- New "Distru Export" tab when Distru CSV is uploaded
+
 v3.3 (2025-11-19)
 - Combined Batch, Quantity, and Sell-By into single column
 - Layout: Batch on top, Qty with line below, Sell-By with line at bottom
@@ -55,12 +62,12 @@ from reportlab.lib.enums import TA_CENTER
 # ============================================================================
 
 st.set_page_config(
-    page_title="DC Receiving Tool v3.3",
+    page_title="DC Receiving Tool v3.4",
     page_icon="📦",
     layout="wide"
 )
 
-VERSION = "3.3"
+VERSION = "3.4"
 
 # ============================================================================
 # PDF EXTRACTION FUNCTIONS
@@ -104,7 +111,44 @@ def extract_originating_entity(text: str) -> Optional[str]:
                 return origin
     return None
 
-def extract_packages(text: str) -> List[Dict]:
+def parse_distru_csv(uploaded_file) -> Dict[str, Dict]:
+    """
+    Parse Distru Packages CSV and create lookup dictionary
+    
+    Returns:
+        Dictionary mapping Package Label (METRC ID) to Distru package data
+        Example: {'1A406030006E731000695754': {'distru_id': '20604864', 'distru_product': '...', ...}}
+    """
+    try:
+        # Read CSV
+        df = pd.read_csv(uploaded_file)
+        
+        # Create lookup dictionary keyed by Package Label (METRC Package ID)
+        distru_lookup = {}
+        
+        for _, row in df.iterrows():
+            package_label = str(row.get('Package Label', '')).strip()
+            
+            if package_label:
+                distru_lookup[package_label] = {
+                    'distru_id': str(row.get('ID', '')),
+                    'distru_product': str(row.get('Distru Product', '')),
+                    'distru_batch_number': str(row.get('Distru Batch Number', '')),
+                    'license_number': str(row.get('License Number', '')),
+                    'location': str(row.get('Location', '')),
+                    'expiration_date': str(row.get('Expiration Date', '')),
+                    'harvest_date': str(row.get('Harvest Date', '')),
+                    'description': str(row.get('Description', '')),
+                    'quantity': str(row.get('Quantity', ''))
+                }
+        
+        return distru_lookup
+        
+    except Exception as e:
+        st.error(f"Error parsing Distru CSV: {str(e)}")
+        return {}
+
+def extract_packages(text: str, distru_lookup: Optional[Dict] = None) -> List[Dict]:
     """Extract package information from manifest text using line-by-line parsing"""
     lines = text.split('\n')
     packages = []
@@ -120,7 +164,7 @@ def extract_packages(text: str) -> List[Dict]:
                 package_count += 1
                 i += 5  # Skip header lines
                 
-                package_data = extract_single_package(lines, i, package_count)
+                package_data = extract_single_package(lines, i, package_count, distru_lookup)
                 if package_data:
                     packages.append(package_data)
         
@@ -128,7 +172,7 @@ def extract_packages(text: str) -> List[Dict]:
     
     return packages
 
-def extract_single_package(lines: List[str], start_idx: int, package_num: int) -> Optional[Dict]:
+def extract_single_package(lines: List[str], start_idx: int, package_num: int, distru_lookup: Optional[Dict] = None) -> Optional[Dict]:
     """Extract a single package starting from given line index"""
     package_data = {
         'package_number': package_num,
@@ -240,6 +284,31 @@ def extract_single_package(lines: List[str], start_idx: int, package_num: int) -
                         package_data['production_batch'] = batch_match.group(1)
             break
     
+    # Add Distru data if available
+    if distru_lookup and package_data['package_id']:
+        distru_data = distru_lookup.get(package_data['package_id'])
+        if distru_data:
+            package_data['distru_id'] = distru_data.get('distru_id', '')
+            package_data['distru_product'] = distru_data.get('distru_product', '')
+            package_data['distru_batch_number'] = distru_data.get('distru_batch_number', '')
+            package_data['license_number'] = distru_data.get('license_number', '')
+            package_data['location'] = distru_data.get('location', '')
+            package_data['expiration_date'] = distru_data.get('expiration_date', '')
+            package_data['harvest_date'] = distru_data.get('harvest_date', '')
+            package_data['description'] = distru_data.get('description', '')
+            package_data['distru_matched'] = True
+        else:
+            # No match found - initialize empty fields
+            package_data['distru_id'] = ''
+            package_data['distru_product'] = ''
+            package_data['distru_batch_number'] = ''
+            package_data['license_number'] = ''
+            package_data['location'] = ''
+            package_data['expiration_date'] = ''
+            package_data['harvest_date'] = ''
+            package_data['description'] = ''
+            package_data['distru_matched'] = False
+    
     return package_data
 
 # ============================================================================
@@ -266,6 +335,50 @@ def packages_to_dataframe(packages: List[Dict]) -> pd.DataFrame:
         rows.append(row)
     
     return pd.DataFrame(rows)
+
+def generate_distru_export_csv(packages: List[Dict]) -> io.StringIO:
+    """
+    Generate Distru Import CSV with exact column format
+    
+    Output columns (exact format required by Distru):
+    - Distru ID
+    - Package Number
+    - Distru Product Name
+    - License Number
+    - Location Name
+    - Distru Batch Number
+    - Expiration Date
+    - Harvest Date
+    - Description
+    - Bin Names (comma separated)
+    """
+    if not packages:
+        return io.StringIO()
+    
+    rows = []
+    for pkg in packages:
+        row = {
+            'Distru ID': pkg.get('distru_id', ''),
+            'Package Number': pkg.get('package_id', ''),
+            'Distru Product Name': pkg.get('distru_product', ''),
+            'License Number': pkg.get('license_number', ''),
+            'Location Name': pkg.get('location', ''),
+            'Distru Batch Number': pkg.get('distru_batch_number', ''),
+            'Expiration Date': pkg.get('expiration_date', ''),
+            'Harvest Date': pkg.get('harvest_date', ''),
+            'Description': pkg.get('description', ''),
+            'Bin Names (comma separated)': ''  # Empty by default, user can fill in manually
+        }
+        rows.append(row)
+    
+    df = pd.DataFrame(rows)
+    
+    # Create CSV in memory
+    csv_buffer = io.StringIO()
+    df.to_csv(csv_buffer, index=False)
+    csv_buffer.seek(0)
+    
+    return csv_buffer
 
 # ============================================================================
 # PDF GENERATION FUNCTIONS
@@ -417,6 +530,25 @@ def main():
         help="Upload a Metrc transfer manifest PDF"
     )
     
+    # Optional Distru CSV uploader
+    st.sidebar.markdown("---")
+    st.sidebar.header("🔗 Distru Integration (Optional)")
+    distru_csv = st.sidebar.file_uploader(
+        "Upload Distru Packages CSV:",
+        type=['csv'],
+        help="Optional: Upload Distru packages CSV to match and export"
+    )
+    
+    # Parse Distru CSV if uploaded
+    distru_lookup = None
+    if distru_csv:
+        with st.spinner("Parsing Distru CSV..."):
+            distru_lookup = parse_distru_csv(distru_csv)
+            if distru_lookup:
+                st.sidebar.success(f"✅ Loaded {len(distru_lookup)} Distru packages")
+            else:
+                st.sidebar.warning("⚠️ No Distru packages loaded")
+    
     if uploaded_file:
         # Extract text from PDF
         with st.spinner("Reading PDF..."):
@@ -441,9 +573,9 @@ def main():
         with col3:
             st.metric("To", destination or "Not Found")
         
-        # Extract packages
+        # Extract packages (with optional Distru matching)
         with st.spinner("Extracting package data..."):
-            packages = extract_packages(pdf_text)
+            packages = extract_packages(pdf_text, distru_lookup)
         
         if not packages:
             st.warning("No packages found in manifest")
@@ -454,11 +586,20 @@ def main():
         
         st.success(f"✅ Found {len(packages)} packages")
         
+        # Show Distru matching stats if Distru CSV was uploaded
+        if distru_lookup:
+            matched_count = sum(1 for pkg in packages if pkg.get('distru_matched', False))
+            st.info(f"🔗 Distru Matching: {matched_count}/{len(packages)} packages matched")
+        
         # Convert to DataFrame
         df = packages_to_dataframe(packages)
         
-        # Tabs for different views
-        tabs = st.tabs(["📊 Overview", "📋 Package List", "✏️ Enter Received Quantities"])
+        # Tabs for different views (add Distru Export if Distru CSV uploaded)
+        tab_names = ["📊 Overview", "📋 Package List", "✏️ Enter Received Quantities"]
+        if distru_lookup:
+            tab_names.append("🔗 Distru Export")
+        
+        tabs = st.tabs(tab_names)
         
         with tabs[0]:  # Overview
             st.subheader("📊 Manifest Overview")
@@ -601,6 +742,92 @@ def main():
                 f"manifest_{manifest_num}_receiving_report.csv",
                 "text/csv"
             )
+        
+        # Distru Export tab (only if Distru CSV was uploaded)
+        if distru_lookup:
+            with tabs[3]:  # Distru Export tab
+                st.subheader("🔗 Distru Import Export")
+                st.markdown("Export package data in Distru import format")
+                
+                # Show matching summary
+                matched_pkgs = [pkg for pkg in packages if pkg.get('distru_matched', False)]
+                unmatched_pkgs = [pkg for pkg in packages if not pkg.get('distru_matched', False)]
+                
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    st.metric("Total Packages", len(packages))
+                with col2:
+                    st.metric("Matched to Distru", len(matched_pkgs), 
+                             delta=f"{len(matched_pkgs)/len(packages)*100:.1f}%" if packages else "0%")
+                with col3:
+                    st.metric("Unmatched", len(unmatched_pkgs))
+                
+                # Show matched packages
+                if matched_pkgs:
+                    st.success(f"✅ {len(matched_pkgs)} packages matched successfully")
+                    
+                    with st.expander("View Matched Packages"):
+                        matched_df = pd.DataFrame([{
+                            'Package #': pkg['package_number'],
+                            'METRC Package ID': pkg['package_id'],
+                            'Distru ID': pkg.get('distru_id', ''),
+                            'Distru Product': pkg.get('distru_product', ''),
+                            'Distru Batch': pkg.get('distru_batch_number', ''),
+                            'Location': pkg.get('location', '')
+                        } for pkg in matched_pkgs])
+                        st.dataframe(matched_df, use_container_width=True)
+                
+                # Show unmatched packages
+                if unmatched_pkgs:
+                    st.warning(f"⚠️ {len(unmatched_pkgs)} packages could not be matched")
+                    
+                    with st.expander("View Unmatched Packages"):
+                        unmatched_df = pd.DataFrame([{
+                            'Package #': pkg['package_number'],
+                            'METRC Package ID': pkg['package_id'],
+                            'Item Name': pkg['item_name']
+                        } for pkg in unmatched_pkgs])
+                        st.dataframe(unmatched_df, use_container_width=True)
+                
+                st.markdown("---")
+                
+                # Generate Distru Export
+                st.subheader("📤 Export for Distru")
+                st.markdown("""
+                This export includes all packages with the exact column format required by Distru:
+                - Distru ID, Package Number, Distru Product Name, License Number, Location Name
+                - Distru Batch Number, Expiration Date, Harvest Date, Description, Bin Names
+                """)
+                
+                if st.button("📤 Generate Distru Export CSV", type="primary", use_container_width=True):
+                    with st.spinner("Generating Distru export..."):
+                        csv_buffer = generate_distru_export_csv(packages)
+                        
+                        st.success("✅ Distru export generated!")
+                        st.download_button(
+                            label="📥 Download Distru Import CSV",
+                            data=csv_buffer.getvalue(),
+                            file_name=f"distru_import_{manifest_num}.csv",
+                            mime="text/csv",
+                            type="primary",
+                            use_container_width=True
+                        )
+                
+                # Preview export data
+                with st.expander("Preview Export Data"):
+                    preview_df = pd.DataFrame([{
+                        'Distru ID': pkg.get('distru_id', ''),
+                        'Package Number': pkg['package_id'],
+                        'Distru Product Name': pkg.get('distru_product', ''),
+                        'License Number': pkg.get('license_number', ''),
+                        'Location Name': pkg.get('location', ''),
+                        'Distru Batch Number': pkg.get('distru_batch_number', ''),
+                        'Expiration Date': pkg.get('expiration_date', ''),
+                        'Harvest Date': pkg.get('harvest_date', ''),
+                        'Description': pkg.get('description', ''),
+                        'Bin Names (comma separated)': ''
+                    } for pkg in packages])
+                    st.dataframe(preview_df, use_container_width=True)
     
     else:
         # Instructions
