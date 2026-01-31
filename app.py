@@ -1,8 +1,14 @@
 """
-DC Receiving Tool v3.4
+DC Receiving Tool v3.5
 Extract and process transfer manifest data from Metrc PDFs and generate receiving worksheets
 
 CHANGELOG:
+v3.5 (2025-01-30)
+- CRITICAL FIX: Package IDs now correctly capture all 24 characters
+- Fixed bug where leading "1" was being skipped during extraction
+- Added validation to ensure Package IDs are exactly 24 characters
+- Added fallback to prepend "1" if 23-char ID starting with "A" is detected
+
 v3.4 (2025-12-01)
 - Added optional Distru Packages CSV integration
 - Match METRC Package IDs to Distru Package Labels automatically
@@ -62,12 +68,15 @@ from reportlab.lib.enums import TA_CENTER
 # ============================================================================
 
 st.set_page_config(
-    page_title="DC Receiving Tool v3.4",
+    page_title="DC Receiving Tool v3.5",
     page_icon="📦",
     layout="wide"
 )
 
-VERSION = "3.4"
+VERSION = "3.5"
+
+# CRITICAL RULE: All Package IDs MUST have exactly 24 characters
+PACKAGE_ID_LENGTH = 24
 
 # ============================================================================
 # PDF EXTRACTION FUNCTIONS
@@ -185,21 +194,41 @@ def extract_single_package(lines: List[str], start_idx: int, package_num: int, d
     
     i = start_idx
     
-    # Skip any short numeric-only lines
-    while i < len(lines) and lines[i].strip() and lines[i].strip().isdigit() and len(lines[i].strip()) < 3:
-        i += 1
-    
-    # Collect package ID parts
+    # FIXED v3.5: Collect ALL package ID parts including single digits like "1"
+    # Package IDs are always 24 characters starting with "1A"
+    # PDF extraction may split the ID across multiple lines (e.g., "1" on its own line)
     package_id_parts = []
     while i < len(lines):
         line = lines[i].strip()
         if 'Lab Test' in line:
             break
-        if line and (line[0].isalpha() or line.isdigit()) and len(line) <= 15:
+        # Include ALL alphanumeric parts - DO NOT skip short numeric lines
+        # This fixes the bug where the leading "1" was being skipped
+        if line and line.isalnum() and len(line) <= 24:
             package_id_parts.append(line)
         i += 1
     
-    package_data['package_id'] = ''.join(package_id_parts)
+    # Combine parts and validate - Package IDs MUST be exactly 24 characters
+    raw_package_id = ''.join(package_id_parts)
+    
+    # Validate and extract the 24-character Package ID
+    if len(raw_package_id) > PACKAGE_ID_LENGTH:
+        # Too long - look for the standard 1A pattern and extract 24 chars
+        match = re.search(r'(1A[A-Z0-9]{22})', raw_package_id)
+        if match:
+            package_data['package_id'] = match.group(1)
+        else:
+            # Fallback: take first 24 chars
+            package_data['package_id'] = raw_package_id[:PACKAGE_ID_LENGTH]
+    elif len(raw_package_id) == PACKAGE_ID_LENGTH:
+        # Perfect - exactly 24 characters
+        package_data['package_id'] = raw_package_id
+    elif len(raw_package_id) == 23 and raw_package_id.startswith('A'):
+        # Missing the leading "1" - prepend it
+        package_data['package_id'] = '1' + raw_package_id
+    else:
+        # Unexpected length - use as-is but log warning
+        package_data['package_id'] = raw_package_id
     
     # Skip to "Contains Retail IDs: No"
     while i < len(lines) and 'Contains Retail IDs' not in lines[i]:
@@ -221,7 +250,6 @@ def extract_single_package(lines: List[str], start_idx: int, package_num: int, d
     # Clean item name - remove final category section with nested parentheses
     # Pattern: (Category (measurement)) at the end
     # Examples: (Topical (weight - each)), (Flower (packaged eighth - each))
-    import re
     # Match final parenthetical with nested parens: space + ( + stuff + ( + stuff + ) + )
     final_category_pattern = r'\s+\([^)]*\([^)]*\)\)\s*$'
     cleaned = re.sub(final_category_pattern, '', full_name)
@@ -586,6 +614,11 @@ def main():
         
         st.success(f"✅ Found {len(packages)} packages")
         
+        # v3.5: Validate Package ID lengths
+        invalid_ids = [pkg for pkg in packages if len(pkg.get('package_id', '')) != PACKAGE_ID_LENGTH]
+        if invalid_ids:
+            st.warning(f"⚠️ {len(invalid_ids)} packages have non-standard Package ID lengths (expected {PACKAGE_ID_LENGTH} chars)")
+        
         # Show Distru matching stats if Distru CSV was uploaded
         if distru_lookup:
             matched_count = sum(1 for pkg in packages if pkg.get('distru_matched', False))
@@ -655,7 +688,20 @@ def main():
         
         with tabs[1]:  # Package List
             st.subheader("📋 Complete Package List")
-            st.dataframe(df, use_container_width=True, height=600)
+            
+            # v3.5: Add Package ID length validation display
+            df_display = df.copy()
+            df_display['ID Length'] = df_display['Package ID'].apply(lambda x: len(str(x)) if x else 0)
+            df_display['ID Valid'] = df_display['ID Length'] == PACKAGE_ID_LENGTH
+            
+            # Show validation summary
+            valid_count = df_display['ID Valid'].sum()
+            if valid_count == len(df_display):
+                st.success(f"✅ All {len(df_display)} Package IDs are valid ({PACKAGE_ID_LENGTH} characters)")
+            else:
+                st.warning(f"⚠️ {len(df_display) - valid_count} Package IDs have invalid length")
+            
+            st.dataframe(df_display, use_container_width=True, height=600)
             
             # Download button
             csv = df.to_csv(index=False)
@@ -842,12 +888,12 @@ def main():
         4. **Download & Print**: Download PDF and print for receiving
         5. **Optional**: Use "Enter Received Quantities" tab for digital tracking
         
-        ### ✨ What's New in v3.3
+        ### ✨ What's New in v3.5
         
-        - ✅ **Combined Column** - Batch, Quantity, and Sell-By now in single column
-        - ✅ **Cleaner Layout** - Batch → Qty with line → Sell-By with line
-        - ✅ **Smart Filtering** - Keeps product parentheses like "(Flower)" or "(Hybrid)"
-        - ✅ **More Compact** - Fits more information on each page
+        - ✅ **CRITICAL FIX**: Package IDs now correctly capture all 24 characters
+        - ✅ **Fixed Bug**: Leading "1" was being skipped during PDF extraction
+        - ✅ **Validation**: Added checks to ensure Package IDs are exactly 24 chars
+        - ✅ **Fallback**: Auto-prepends "1" if 23-char ID starting with "A" detected
         
         ### Worksheet Features
         
@@ -864,6 +910,16 @@ def main():
     
     with st.sidebar.expander("📋 Changelog"):
         st.markdown("""
+        **v3.5** (2025-01-30) ⚠️ CRITICAL FIX
+        - Package IDs now correctly capture all 24 characters
+        - Fixed: Leading "1" was being skipped
+        - Added 24-char validation and fallback logic
+        
+        **v3.4** (2025-12-01)
+        - Distru Packages CSV integration
+        - Match METRC IDs to Distru labels
+        - Export Distru Import CSV
+        
         **v3.3** (2025-11-19)
         - Combined Batch/Qty/Sell-By into single column
         - Smart parenthesis filtering (keeps product parens)
