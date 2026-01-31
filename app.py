@@ -1,8 +1,23 @@
 """
-DC Receiving Tool v3.5
+DC Receiving Tool v3.7
 Extract and process transfer manifest data from Metrc PDFs and generate receiving worksheets
 
 CHANGELOG:
+v3.7 (2025-01-30)
+- CLEANUP: Removed unused Enter Received Quantities tab
+- CLEANUP: Removed debugging columns (ID Length, ID Valid)
+- UI: Package List now hides index column
+- UI: Reordered columns - Production Batch now after Package ID
+- UI: Removed unused Volume and Strain columns
+- EXPORT: Renamed ID to Distru ID in batch update export
+
+v3.6 (2025-01-30)
+- NEW: Batch Update Export for Distru - outputs Distru ID, Distru Batch Number, Expiration Date
+- Distru Batch Number now uses Production Batch from manifest (the actual batch to import)
+- Expiration Date calculated from Lab Testing Updated Date + 1 year
+- Enhanced Distru Export tab with preview and clear export options
+- Added Lab Testing Updated Date field from Distru CSV
+
 v3.5 (2025-01-30)
 - CRITICAL FIX: Package IDs now correctly capture all 24 characters
 - Fixed bug where leading "1" was being skipped during extraction
@@ -21,34 +36,6 @@ v3.3 (2025-11-19)
 - Layout: Batch on top, Qty with line below, Sell-By with line at bottom
 - Smarter parenthesis filtering: only removes final category section
 - Preserves product name parentheses like "Side Hustle (Flower)"
-
-v3.2 (2025-11-19)
-- Item names now remove ALL content from first opening parenthesis onward
-- Batch and quantity verification lines now truly inline (using plain strings)
-- Quantity displays as whole numbers (no decimals)
-- Cleaner single-line formatting for most items
-
-v3.1 (2025-11-19)
-- Fixed item name trimming to remove last parentheses content (not comma-dependent)
-- Batch numbers now truncate to 20 characters max (no wrapping)
-- Verification lines now inline with batch and quantity (not below)
-- Improved UI layout with Overview tab containing worksheet generation
-- Better organized tabs: Overview, Package List, Enter Received Quantities
-
-v3.0 (2025-11-19)
-- Restored PDF worksheet generation (primary feature)
-- Kept improved item name extraction from v2.x
-- Added receiving quantity entry workflow
-- Generate professional worksheets for physical receiving
-
-v2.2 (2025-11-19)
-- Changed to only show Quantity Shipped
-- Edit mode for entering received quantities
-- Removed Qty Received column from initial view
-
-v2.1 (2025-11-19)
-- Fixed item name extraction to correctly capture product names
-- Added line-by-line parsing for better accuracy
 """
 
 import streamlit as st
@@ -56,6 +43,7 @@ import pandas as pd
 import io
 import re
 from typing import List, Dict, Optional
+from datetime import datetime
 from reportlab.lib.pagesizes import letter
 from reportlab.lib.units import inch
 from reportlab.lib import colors
@@ -68,15 +56,62 @@ from reportlab.lib.enums import TA_CENTER
 # ============================================================================
 
 st.set_page_config(
-    page_title="DC Receiving Tool v3.5",
+    page_title="DC Receiving Tool v3.7",
     page_icon="📦",
     layout="wide"
 )
 
-VERSION = "3.5"
+VERSION = "3.7"
 
 # CRITICAL RULE: All Package IDs MUST have exactly 24 characters
 PACKAGE_ID_LENGTH = 24
+
+# ============================================================================
+# UTILITY FUNCTIONS
+# ============================================================================
+
+def calculate_expiration_date(lab_date_str):
+    """
+    Calculate expiration date by adding 1 year to lab testing date
+    
+    Args:
+        lab_date_str: Date string in format YYYY-MM-DD or similar
+        
+    Returns:
+        str: Expiration date in YYYY-MM-DD format, or empty string if invalid
+    """
+    if pd.isna(lab_date_str) or lab_date_str == '' or lab_date_str == 'nan':
+        return ''
+    
+    try:
+        # Parse the date (handles various formats)
+        if isinstance(lab_date_str, str):
+            # Try common formats
+            for fmt in ['%Y-%m-%d', '%m/%d/%Y', '%Y/%m/%d', '%m-%d-%Y']:
+                try:
+                    lab_date = datetime.strptime(lab_date_str.split()[0], fmt)
+                    break
+                except ValueError:
+                    continue
+            else:
+                return ''
+        elif isinstance(lab_date_str, datetime):
+            lab_date = lab_date_str
+        elif hasattr(lab_date_str, 'date'):  # pandas Timestamp
+            lab_date = lab_date_str.to_pydatetime()
+        else:
+            return ''
+        
+        # Add 1 year (handle leap year edge case)
+        try:
+            expiration = lab_date.replace(year=lab_date.year + 1)
+        except ValueError:
+            # Feb 29 -> Feb 28
+            expiration = lab_date.replace(year=lab_date.year + 1, day=28)
+        
+        return expiration.strftime('%Y-%m-%d')
+    except Exception:
+        return ''
 
 # ============================================================================
 # PDF EXTRACTION FUNCTIONS
@@ -148,7 +183,8 @@ def parse_distru_csv(uploaded_file) -> Dict[str, Dict]:
                     'expiration_date': str(row.get('Expiration Date', '')),
                     'harvest_date': str(row.get('Harvest Date', '')),
                     'description': str(row.get('Description', '')),
-                    'quantity': str(row.get('Quantity', ''))
+                    'quantity': str(row.get('Quantity', '')),
+                    'lab_testing_date': str(row.get('Lab Testing Updated Date', ''))  # For expiration calc
                 }
         
         return distru_lookup
@@ -324,6 +360,11 @@ def extract_single_package(lines: List[str], start_idx: int, package_num: int, d
             package_data['expiration_date'] = distru_data.get('expiration_date', '')
             package_data['harvest_date'] = distru_data.get('harvest_date', '')
             package_data['description'] = distru_data.get('description', '')
+            package_data['lab_testing_date'] = distru_data.get('lab_testing_date', '')
+            # Calculate expiration from lab date + 1 year
+            package_data['calculated_expiration'] = calculate_expiration_date(
+                distru_data.get('lab_testing_date', '')
+            )
             package_data['distru_matched'] = True
         else:
             # No match found - initialize empty fields
@@ -335,6 +376,8 @@ def extract_single_package(lines: List[str], start_idx: int, package_num: int, d
             package_data['expiration_date'] = ''
             package_data['harvest_date'] = ''
             package_data['description'] = ''
+            package_data['lab_testing_date'] = ''
+            package_data['calculated_expiration'] = ''
             package_data['distru_matched'] = False
     
     return package_data
@@ -353,12 +396,10 @@ def packages_to_dataframe(packages: List[Dict]) -> pd.DataFrame:
         row = {
             'Package #': pkg['package_number'],
             'Package ID': pkg['package_id'],
+            'Production Batch': pkg['production_batch'],
             'Item Name': pkg['item_name'],
             'Qty Shipped': pkg['quantity_shipped'],
-            'Production Batch': pkg['production_batch'],
-            'Weight': pkg['item_details'].get('weight', ''),
-            'Volume': pkg['item_details'].get('volume', ''),
-            'Strain': pkg['item_details'].get('strain', '')
+            'Weight': pkg['item_details'].get('weight', '')
         }
         rows.append(row)
     
@@ -366,7 +407,7 @@ def packages_to_dataframe(packages: List[Dict]) -> pd.DataFrame:
 
 def generate_distru_export_csv(packages: List[Dict]) -> io.StringIO:
     """
-    Generate Distru Import CSV with exact column format
+    Generate Distru Import CSV with exact column format for FULL import
     
     Output columns (exact format required by Distru):
     - Distru ID
@@ -398,6 +439,44 @@ def generate_distru_export_csv(packages: List[Dict]) -> io.StringIO:
             'Bin Names (comma separated)': ''  # Empty by default, user can fill in manually
         }
         rows.append(row)
+    
+    df = pd.DataFrame(rows)
+    
+    # Create CSV in memory
+    csv_buffer = io.StringIO()
+    df.to_csv(csv_buffer, index=False)
+    csv_buffer.seek(0)
+    
+    return csv_buffer
+
+
+def generate_distru_batch_update_csv(packages: List[Dict]) -> io.StringIO:
+    """
+    Generate Distru Batch Update CSV - simplified format for updating batch numbers
+    
+    This uses:
+    - Distru ID: Distru Package ID
+    - Distru Batch Number: Production Batch from manifest (the NEW batch number to import)
+    - Expiration Date: Calculated from Lab Testing Date + 1 year
+    
+    Output columns:
+    - Distru ID
+    - Distru Batch Number
+    - Expiration Date
+    """
+    if not packages:
+        return io.StringIO()
+    
+    rows = []
+    for pkg in packages:
+        # Only include packages that matched Distru AND have a production batch
+        if pkg.get('distru_matched') and pkg.get('production_batch'):
+            row = {
+                'Distru ID': pkg.get('distru_id', ''),
+                'Distru Batch Number': pkg.get('production_batch', ''),  # Use manifest's Production Batch
+                'Expiration Date': pkg.get('calculated_expiration', '')  # Lab date + 1 year
+            }
+            rows.append(row)
     
     df = pd.DataFrame(rows)
     
@@ -607,17 +686,9 @@ def main():
         
         if not packages:
             st.warning("No packages found in manifest")
-            
-            with st.expander("🔍 Debug: View Raw Text"):
-                st.text_area("PDF Text (first 2000 chars)", pdf_text[:2000], height=400)
             return
         
         st.success(f"✅ Found {len(packages)} packages")
-        
-        # v3.5: Validate Package ID lengths
-        invalid_ids = [pkg for pkg in packages if len(pkg.get('package_id', '')) != PACKAGE_ID_LENGTH]
-        if invalid_ids:
-            st.warning(f"⚠️ {len(invalid_ids)} packages have non-standard Package ID lengths (expected {PACKAGE_ID_LENGTH} chars)")
         
         # Show Distru matching stats if Distru CSV was uploaded
         if distru_lookup:
@@ -628,7 +699,7 @@ def main():
         df = packages_to_dataframe(packages)
         
         # Tabs for different views (add Distru Export if Distru CSV uploaded)
-        tab_names = ["📊 Overview", "📋 Package List", "✏️ Enter Received Quantities"]
+        tab_names = ["📊 Overview", "📋 Package List"]
         if distru_lookup:
             tab_names.append("🔗 Distru Export")
         
@@ -689,19 +760,7 @@ def main():
         with tabs[1]:  # Package List
             st.subheader("📋 Complete Package List")
             
-            # v3.5: Add Package ID length validation display
-            df_display = df.copy()
-            df_display['ID Length'] = df_display['Package ID'].apply(lambda x: len(str(x)) if x else 0)
-            df_display['ID Valid'] = df_display['ID Length'] == PACKAGE_ID_LENGTH
-            
-            # Show validation summary
-            valid_count = df_display['ID Valid'].sum()
-            if valid_count == len(df_display):
-                st.success(f"✅ All {len(df_display)} Package IDs are valid ({PACKAGE_ID_LENGTH} characters)")
-            else:
-                st.warning(f"⚠️ {len(df_display) - valid_count} Package IDs have invalid length")
-            
-            st.dataframe(df_display, use_container_width=True, height=600)
+            st.dataframe(df, use_container_width=True, height=600, hide_index=True)
             
             # Download button
             csv = df.to_csv(index=False)
@@ -712,100 +771,27 @@ def main():
                 "text/csv"
             )
         
-        with tabs[2]:  # Enter Received Quantities
-            st.subheader("Enter Received Quantities")
-            st.markdown("Enter the quantities you received for each package:")
-            
-            # Create form for receiving
-            received_data = df.copy()
-            received_data['Qty Received'] = 0.0
-            
-            for idx, row in received_data.iterrows():
-                col1, col2, col3, col4 = st.columns([1, 3, 1, 1])
-                
-                with col1:
-                    st.text(f"#{row['Package #']}")
-                
-                with col2:
-                    # Show full item name in expander if too long
-                    if len(row['Item Name']) > 50:
-                        st.text(row['Item Name'][:50] + "...")
-                        with st.expander("Show full name"):
-                            st.text(row['Item Name'])
-                    else:
-                        st.text(row['Item Name'])
-                
-                with col3:
-                    st.text(f"Shipped: {row['Qty Shipped']}")
-                
-                with col4:
-                    received = st.number_input(
-                        "Received",
-                        value=float(row['Qty Shipped'] or 0),
-                        min_value=0.0,
-                        step=1.0,
-                        key=f"rcv_{idx}",
-                        label_visibility="collapsed"
-                    )
-                    received_data.at[idx, 'Qty Received'] = received
-            
-            # Calculate variance
-            received_data['Variance'] = received_data['Qty Received'] - received_data['Qty Shipped']
-            received_data['Variance %'] = received_data.apply(
-                lambda row: (row['Variance'] / row['Qty Shipped'] * 100) 
-                if pd.notna(row['Qty Shipped']) and row['Qty Shipped'] > 0 
-                else None,
-                axis=1
-            )
-            
-            st.markdown("---")
-            st.subheader("Receiving Summary")
-            
-            # Show variance summary
-            total_shipped = received_data['Qty Shipped'].sum()
-            total_received = received_data['Qty Received'].sum()
-            total_variance = total_received - total_shipped
-            
-            col1, col2, col3 = st.columns(3)
-            with col1:
-                st.metric("Total Shipped", f"{total_shipped:,.0f} ea")
-            with col2:
-                st.metric("Total Received", f"{total_received:,.0f} ea")
-            with col3:
-                st.metric("Total Variance", f"{total_variance:,.0f} ea")
-            
-            # Show updated data
-            st.dataframe(
-                received_data[['Package #', 'Package ID', 'Item Name', 'Qty Shipped', 'Qty Received', 'Variance', 'Variance %']],
-                use_container_width=True
-            )
-            
-            # Download button
-            received_csv = received_data.to_csv(index=False)
-            st.download_button(
-                "📥 Download Receiving Report",
-                received_csv,
-                f"manifest_{manifest_num}_receiving_report.csv",
-                "text/csv"
-            )
-        
         # Distru Export tab (only if Distru CSV was uploaded)
         if distru_lookup:
-            with tabs[3]:  # Distru Export tab
-                st.subheader("🔗 Distru Import Export")
-                st.markdown("Export package data in Distru import format")
+            with tabs[2]:  # Distru Export tab
+                st.subheader("🔗 Distru Export Options")
+                st.markdown("Export package data for Distru import")
                 
                 # Show matching summary
                 matched_pkgs = [pkg for pkg in packages if pkg.get('distru_matched', False)]
                 unmatched_pkgs = [pkg for pkg in packages if not pkg.get('distru_matched', False)]
+                # Count how many matched packages have production batch
+                matched_with_batch = [pkg for pkg in matched_pkgs if pkg.get('production_batch')]
                 
-                col1, col2, col3 = st.columns(3)
+                col1, col2, col3, col4 = st.columns(4)
                 with col1:
                     st.metric("Total Packages", len(packages))
                 with col2:
                     st.metric("Matched to Distru", len(matched_pkgs), 
                              delta=f"{len(matched_pkgs)/len(packages)*100:.1f}%" if packages else "0%")
                 with col3:
+                    st.metric("With Batch Info", len(matched_with_batch))
+                with col4:
                     st.metric("Unmatched", len(unmatched_pkgs))
                 
                 # Show matched packages
@@ -818,8 +804,9 @@ def main():
                             'METRC Package ID': pkg['package_id'],
                             'Distru ID': pkg.get('distru_id', ''),
                             'Distru Product': pkg.get('distru_product', ''),
-                            'Distru Batch': pkg.get('distru_batch_number', ''),
-                            'Location': pkg.get('location', '')
+                            'Production Batch': pkg.get('production_batch', ''),
+                            'Lab Testing Date': pkg.get('lab_testing_date', ''),
+                            'Calc. Expiration': pkg.get('calculated_expiration', '')
                         } for pkg in matched_pkgs])
                         st.dataframe(matched_df, use_container_width=True)
                 
@@ -837,43 +824,70 @@ def main():
                 
                 st.markdown("---")
                 
-                # Generate Distru Export
-                st.subheader("📤 Export for Distru")
+                # ================================================================
+                # BATCH UPDATE EXPORT (Primary - what user asked for)
+                # ================================================================
+                st.subheader("📤 Batch Update Export (Recommended)")
                 st.markdown("""
-                This export includes all packages with the exact column format required by Distru:
-                - Distru ID, Package Number, Distru Product Name, License Number, Location Name
-                - Distru Batch Number, Expiration Date, Harvest Date, Description, Bin Names
+                **Use this export to update Distru packages with batch numbers from this manifest.**
+                
+                Output format:
+                - **ID** - Distru Package ID
+                - **Distru Batch Number** - Production Batch from manifest
+                - **Expiration Date** - Lab Testing Date + 1 year
                 """)
                 
-                if st.button("📤 Generate Distru Export CSV", type="primary", use_container_width=True):
-                    with st.spinner("Generating Distru export..."):
-                        csv_buffer = generate_distru_export_csv(packages)
-                        
-                        st.success("✅ Distru export generated!")
-                        st.download_button(
-                            label="📥 Download Distru Import CSV",
-                            data=csv_buffer.getvalue(),
-                            file_name=f"distru_import_{manifest_num}.csv",
-                            mime="text/csv",
-                            type="primary",
-                            use_container_width=True
-                        )
+                if len(matched_with_batch) > 0:
+                    # Preview the batch update data
+                    with st.expander("Preview Batch Update Data", expanded=True):
+                        preview_df = pd.DataFrame([{
+                            'ID': pkg.get('distru_id', ''),
+                            'Distru Batch Number': pkg.get('production_batch', ''),
+                            'Expiration Date': pkg.get('calculated_expiration', ''),
+                            'Distru Product': pkg.get('distru_product', '')  # For reference only
+                        } for pkg in matched_with_batch])
+                        st.dataframe(preview_df, use_container_width=True)
+                    
+                    if st.button("📤 Generate Batch Update CSV", type="primary", use_container_width=True):
+                        with st.spinner("Generating batch update export..."):
+                            csv_buffer = generate_distru_batch_update_csv(packages)
+                            
+                            st.success(f"✅ Batch update export generated with {len(matched_with_batch)} packages!")
+                            st.download_button(
+                                label="📥 Download Batch Update CSV",
+                                data=csv_buffer.getvalue(),
+                                file_name=f"distru_batch_update_{manifest_num}.csv",
+                                mime="text/csv",
+                                type="primary",
+                                use_container_width=True
+                            )
+                else:
+                    st.warning("⚠️ No matched packages with production batch information available")
                 
-                # Preview export data
-                with st.expander("Preview Export Data"):
-                    preview_df = pd.DataFrame([{
-                        'Distru ID': pkg.get('distru_id', ''),
-                        'Package Number': pkg['package_id'],
-                        'Distru Product Name': pkg.get('distru_product', ''),
-                        'License Number': pkg.get('license_number', ''),
-                        'Location Name': pkg.get('location', ''),
-                        'Distru Batch Number': pkg.get('distru_batch_number', ''),
-                        'Expiration Date': pkg.get('expiration_date', ''),
-                        'Harvest Date': pkg.get('harvest_date', ''),
-                        'Description': pkg.get('description', ''),
-                        'Bin Names (comma separated)': ''
-                    } for pkg in packages])
-                    st.dataframe(preview_df, use_container_width=True)
+                st.markdown("---")
+                
+                # ================================================================
+                # FULL DISTRU EXPORT (Secondary - original functionality)
+                # ================================================================
+                with st.expander("📦 Full Distru Export (All Fields)"):
+                    st.markdown("""
+                    Full export with all Distru fields:
+                    - Distru ID, Package Number, Distru Product Name, License Number, Location Name
+                    - Distru Batch Number, Expiration Date, Harvest Date, Description, Bin Names
+                    """)
+                    
+                    if st.button("📤 Generate Full Distru Export CSV", use_container_width=True):
+                        with st.spinner("Generating Distru export..."):
+                            csv_buffer = generate_distru_export_csv(packages)
+                            
+                            st.success("✅ Distru export generated!")
+                            st.download_button(
+                                label="📥 Download Full Distru Import CSV",
+                                data=csv_buffer.getvalue(),
+                                file_name=f"distru_full_import_{manifest_num}.csv",
+                                mime="text/csv",
+                                use_container_width=True
+                            )
     
     else:
         # Instructions
@@ -886,14 +900,14 @@ def main():
         2. **Review Overview**: Check manifest info and package count
         3. **Generate Worksheet**: Click button to create printable worksheet
         4. **Download & Print**: Download PDF and print for receiving
-        5. **Optional**: Use "Enter Received Quantities" tab for digital tracking
+        5. **Optional**: Upload Distru CSV for batch number export
         
-        ### ✨ What's New in v3.5
+        ### ✨ What's New in v3.7
         
-        - ✅ **CRITICAL FIX**: Package IDs now correctly capture all 24 characters
-        - ✅ **Fixed Bug**: Leading "1" was being skipped during PDF extraction
-        - ✅ **Validation**: Added checks to ensure Package IDs are exactly 24 chars
-        - ✅ **Fallback**: Auto-prepends "1" if 23-char ID starting with "A" detected
+        - ✅ **Batch Update Export**: Distru ID, Batch Number, Expiration Date
+        - ✅ **Production Batch**: Uses manifest's Production Batch as Distru Batch Number
+        - ✅ **Expiration Date**: Auto-calculated from Lab Testing Date + 1 year
+        - ✅ **Cleaner UI**: Removed unused tabs and debug columns
         
         ### Worksheet Features
         
@@ -910,10 +924,20 @@ def main():
     
     with st.sidebar.expander("📋 Changelog"):
         st.markdown("""
+        **v3.7** (2025-01-30) 🆕
+        - Removed unused Enter Received Quantities tab
+        - Removed debug columns (ID Length, ID Valid)
+        - Cleaner Package List (hidden index, reordered cols)
+        - Export uses "Distru ID" column name
+        
+        **v3.6** (2025-01-30)
+        - NEW: Batch Update Export (Distru ID, Batch, Expiration)
+        - Uses Production Batch from manifest
+        - Calculates Expiration = Lab Date + 1 year
+        
         **v3.5** (2025-01-30) ⚠️ CRITICAL FIX
         - Package IDs now correctly capture all 24 characters
         - Fixed: Leading "1" was being skipped
-        - Added 24-char validation and fallback logic
         
         **v3.4** (2025-12-01)
         - Distru Packages CSV integration
@@ -923,7 +947,6 @@ def main():
         **v3.3** (2025-11-19)
         - Combined Batch/Qty/Sell-By into single column
         - Smart parenthesis filtering (keeps product parens)
-        - Batch → Qty with line → Sell-By with line
         
         **v3.2** (2025-11-19)
         - Item names: remove from FIRST ( onward
